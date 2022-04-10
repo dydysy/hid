@@ -59,7 +59,7 @@ import (
 var enumerateLock sync.Mutex
 
 // Supported returns whether this platform is supported by the HID library or not.
-// The goal of this method is to allow programatically handling platforms that do
+// The goal of this method is to allow programmatically handling platforms that do
 // not support USB HID and not having to fall back to build constraints.
 func Supported() bool {
 	return true
@@ -172,7 +172,7 @@ func (dev *Device) Write(b []byte) (int, error) {
 	// Execute the write operation
 	written := int(C.hid_write(device, (*C.uchar)(&report[0]), C.size_t(len(report))))
 	if written == -1 {
-		// If the write failed, verify if closed or other error
+		// If to write failed, verify if closed or other error
 		dev.lock.Lock()
 		device = dev.device
 		dev.lock.Unlock()
@@ -192,7 +192,6 @@ func (dev *Device) Write(b []byte) (int, error) {
 }
 
 // SendFeatureReport sends a feature report to a HID device
-//
 // Feature reports are sent over the Control endpoint as a Set_Report transfer.
 // The first byte of b must contain the Report ID. For devices which only
 // support a single report, this must be set to 0x0. The remaining bytes
@@ -219,7 +218,7 @@ func (dev *Device) SendFeatureReport(b []byte) (int, error) {
 	// Send the feature report
 	written := int(C.hid_send_feature_report(device, (*C.uchar)(&b[0]), C.size_t(len(b))))
 	if written == -1 {
-		// If the write failed, verify if closed or other error
+		// If to write failed, verify if closed or other error
 		dev.lock.Lock()
 		device = dev.device
 		dev.lock.Unlock()
@@ -238,9 +237,22 @@ func (dev *Device) SendFeatureReport(b []byte) (int, error) {
 	return written, nil
 }
 
-// Read retrieves an input report from a HID device.
+// Read is a wrapper to ReadTimeout that will check if device blocking is enabled
+// and set timeout accordingly.
+// This reproduces C.hid_read() behaviour in wrapping hid_read_timeout:
+// return hid_read_timeout(dev, data, length, (dev->blocking)? -1: 0);
 func (dev *Device) Read(b []byte) (int, error) {
-	// Aborth if nothing to read
+	var timeout int
+	if int(dev.device.blocking) == 1 {
+		timeout = -1
+	}
+	return dev.ReadTimeout(b, timeout)
+}
+
+// ReadTimeout retrieves an input report from a HID device with a timeout. If timeout is -1 a
+// blocking read is performed, else a non-blocking that waits timeout milliseconds
+func (dev *Device) ReadTimeout(b []byte, timeout int) (int, error) {
+	// Abort if nothing to read
 	if len(b) == 0 {
 		return 0, nil
 	}
@@ -253,7 +265,7 @@ func (dev *Device) Read(b []byte) (int, error) {
 		return 0, ErrDeviceClosed
 	}
 	// Execute the read operation
-	read := int(C.hid_read(device, (*C.uchar)(&b[0]), C.size_t(len(b))))
+	read := int(C.hid_read_timeout(device, (*C.uchar)(&b[0]), C.size_t(len(b)), C.int(timeout)))
 	if read == -1 {
 		// If the read failed, verify if closed or other error
 		dev.lock.Lock()
@@ -274,8 +286,7 @@ func (dev *Device) Read(b []byte) (int, error) {
 	return read, nil
 }
 
-// GetFeatureReport retreives a feature report from a HID device
-//
+// GetFeatureReport retrieves a feature report from a HID device
 // Set the first byte of []b to the Report ID of the report to be read. Make
 // sure to allow space for this extra byte in []b. Upon return, the first byte
 // will still contain the Report ID, and the report data will start in b[1].
@@ -293,7 +304,7 @@ func (dev *Device) GetFeatureReport(b []byte) (int, error) {
 		return 0, ErrDeviceClosed
 	}
 
-	// Retrive the feature report
+	// Retrieve the feature report
 	read := int(C.hid_get_feature_report(device, (*C.uchar)(&b[0]), C.size_t(len(b))))
 	if read == -1 {
 		// If the read failed, verify if closed or other error
@@ -305,7 +316,7 @@ func (dev *Device) GetFeatureReport(b []byte) (int, error) {
 			return 0, ErrDeviceClosed
 		}
 
-		// Device not closed, some other error occured
+		// Device not closed, some other error occurred
 		message := C.hid_error(device)
 		if message == nil {
 			return 0, errors.New("hidapi: unknown failure")
@@ -315,4 +326,89 @@ func (dev *Device) GetFeatureReport(b []byte) (int, error) {
 	}
 
 	return read, nil
+}
+
+//below: https://github.com/bearsh/hid/blob/master/hid_enabled.go
+
+// GetInputReport retrieves an input report from a HID device
+// Set the first byte of []b to the Report ID of the report to be read. Make
+// sure to allow space for this extra byte in []b. Upon return, the first byte
+// will still contain the Report ID, and the report data will start in b[1].
+func (dev *Device) GetInputReport(b []byte) (int, error) {
+	// Abort if we don't have anywhere to write the results
+	if len(b) == 0 {
+		return 0, nil
+	}
+	// Abort if device closed in between
+	dev.lock.Lock()
+	device := dev.device
+	dev.lock.Unlock()
+
+	if device == nil {
+		return 0, ErrDeviceClosed
+	}
+
+	// Retrieve the feature report
+	read := int(C.hid_get_input_report(device, (*C.uchar)(&b[0]), C.size_t(len(b))))
+	if read == -1 {
+		// If the read failed, verify if closed or other error
+		dev.lock.Lock()
+		device = dev.device
+		dev.lock.Unlock()
+
+		if device == nil {
+			return 0, ErrDeviceClosed
+		}
+
+		// Device not closed, some other error occurred
+		message := C.hid_error(device)
+		if message == nil {
+			return 0, errors.New("hidapi: unknown failure")
+		}
+		failure, _ := wcharTToString(message)
+		return 0, errors.New("hidapi: " + failure)
+	}
+
+	return read, nil
+}
+
+// SetNonblocking sets the device handle to be non-blocking.
+// In non-blocking mode calls to Read() will return
+// immediately with a value of 0 if there is no data to be
+// read. In blocking mode, Read() will wait (block) until
+// there is data to read before returning.
+func (dev *Device) SetNonblocking(b bool) error {
+	// Abort if device closed in between
+	dev.lock.Lock()
+	device := dev.device
+	dev.lock.Unlock()
+
+	if device == nil {
+		return ErrDeviceClosed
+	}
+
+	i := C.int(0)
+	if b {
+		i = 1
+	}
+	res := int(C.hid_set_nonblocking(device, i))
+	if res == -1 {
+		// If the read failed, verify if closed or other error
+		dev.lock.Lock()
+		device = dev.device
+		dev.lock.Unlock()
+
+		if device == nil {
+			return ErrDeviceClosed
+		}
+		// Device not closed, some other error occurred
+		message := C.hid_error(device)
+		if message == nil {
+			return errors.New("hidapi: unknown failure")
+		}
+		failure, _ := wcharTToString(message)
+		return errors.New("hidapi: " + failure)
+	}
+
+	return nil
 }
